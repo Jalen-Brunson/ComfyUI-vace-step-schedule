@@ -452,6 +452,14 @@ class WanVaceToVideoScheduled:
                         "- gray_0.5 (stock WanVaceToVideo nodes_wan.py:339): inactive=(input-0.5)*(1-mask)+0.5, reactive=(input-0.5)*mask+0.5. Empty regions become mid-gray, which encodes to a nonzero latent pattern VACE tries to reconstruct, producing visible gray stains/blinking when the mask is wider than the subject. Kept for stock-ComfyUI A/B compat."
                     ),
                 }),
+                "mask_temporal_mode": (["wan_exact", "nearest_exact_legacy"], {
+                    "default": "wan_exact",
+                    "tooltip": (
+                        "How the pixel-frame mask is compressed to latent frames.\n"
+                        "- wan_exact (default): aggregate via WAN VAE's actual t/4+1 layout. Latent 0 = pixel 0; latent k≥1 = max(pixels [(k-1)*4+1, k*4+1)). Boundary frames stay aligned with how the VAE actually encodes the video.\n"
+                        "- nearest_exact_legacy (stock WanVaceToVideo, native ComfyUI): F.interpolate(nearest-exact). PyTorch's align_corners=False mapping does NOT match WAN's t/4+1 layout — boundary latent frames pick up mask values from the wrong pixel position, producing partial regen of supposed-preserve frames. In chunked continuation flows this drift is exactly in the assembler's blend region, making the seam look blurry."
+                    ),
+                }),
                 "verbose": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Log the resolved strength schedule to the ComfyUI console at execute time.",
@@ -471,6 +479,7 @@ class WanVaceToVideoScheduled:
                 multi_ref_mode="horizontal_tile", vace_latent_space="normalized",
                 control_resize_mode="lanczos_nocrop", mask_resize_mode="nearest_nocrop",
                 inactive_fill_mode="black_0.0",
+                mask_temporal_mode="wan_exact",
                 verbose=False):
         schedule = _resolve_schedule(strength_schedule, strength_list)
         # Only use ref_strength_schedule when the socket is connected OR the string is non-empty;
@@ -484,7 +493,7 @@ class WanVaceToVideoScheduled:
                      f"ref_resize_mode={ref_resize_mode} ref_reactive_mode={ref_reactive_mode} "
                      f"multi_ref_mode={multi_ref_mode} vace_latent_space={vace_latent_space} "
                      f"control_resize_mode={control_resize_mode} mask_resize_mode={mask_resize_mode} "
-                     f"inactive_fill_mode={inactive_fill_mode}")
+                     f"inactive_fill_mode={inactive_fill_mode} mask_temporal_mode={mask_temporal_mode}")
         fallback = float(schedule[0]) if schedule else 1.0
 
         # Snap dimensions to a multiple of (VAE_STRIDE * spatial_patch_size) = 8 * 2 = 16.
@@ -602,9 +611,34 @@ class WanVaceToVideoScheduled:
         mask = mask.view(length, height_mask, vae_stride, width_mask, vae_stride)
         mask = mask.permute(2, 4, 0, 1, 3)
         mask = mask.reshape(vae_stride * vae_stride, length, height_mask, width_mask)
-        mask = F.interpolate(
-            mask.unsqueeze(0), size=(latent_length, height_mask, width_mask), mode="nearest-exact"
-        ).squeeze(0)
+
+        if mask_temporal_mode == "wan_exact":
+            # Aggregate per WAN VAE's actual temporal layout: latent 0 ↔ pixel 0,
+            # latent k≥1 ↔ pixels [(k-1)*4+1, k*4+1). amax preserves a "regenerate"
+            # vote from any pixel in the range so boundaries don't silently leak
+            # source content into the reactive channel.
+            new_mask = torch.zeros(
+                (mask.shape[0], latent_length, height_mask, width_mask),
+                dtype=mask.dtype, device=mask.device,
+            )
+            for lt in range(latent_length):
+                if lt == 0:
+                    p_start, p_end = 0, 1
+                else:
+                    p_start = (lt - 1) * 4 + 1
+                    p_end = lt * 4 + 1
+                p_end = min(p_end, length)
+                if p_start >= length:
+                    p_start = max(0, length - 1)
+                    p_end = length
+                if p_start >= p_end:
+                    continue
+                new_mask[:, lt, :, :] = mask[:, p_start:p_end, :, :].amax(dim=1)
+            mask = new_mask
+        else:
+            mask = F.interpolate(
+                mask.unsqueeze(0), size=(latent_length, height_mask, width_mask), mode="nearest-exact"
+            ).squeeze(0)
 
         trim_latent = 0
         if reference_image is not None:
@@ -1513,6 +1547,247 @@ class LatentNoiseMaskRebase:
         return (out,)
 
 
+class WanPixelMaskToLatentMask:
+    """Convert a pixel-frame mask to a latent-frame mask using WAN VAE's exact
+    temporal compression (latent 0 ↔ pixel 0; latent k≥1 ↔ pixels [(k-1)*4+1, k*4+1)).
+
+    Why this exists:
+        ComfyUI's `comfy.utils.reshape_mask` uses 3D trilinear interpolation
+        (align_corners=False) to take a pixel-space mask down to latent dims.
+        PyTorch's mapping centers each output position evenly across the input
+        range, which does NOT match WAN's t/4+1 layout. The result is fractional
+        mask values at the preserve/regenerate boundary — boundary latent frames
+        get partial regeneration, which drifts their decoded pixels away from
+        the source. In chunked-continuation flows that overlap region is exactly
+        what the assembler crossfades, so the seam ends up blurry.
+
+        Build the latent mask once with this node and feed it into both
+        `LatentNoiseMaskRebase` and `SetLatentNoiseMask`. Because the temporal
+        axis already matches the target, the downstream `reshape_mask` calls
+        become a no-op for time (they only do spatial bilinear interp).
+
+    Wiring:
+
+        VideoContinuationGenerator -> mask (T_pixel)
+        MaskPrependRefFrame -> padded mask (T_pixel + trim_latent*4)
+        WanPixelMaskToLatentMask(padded, latent_frame_count) -> latent mask (T_latent)
+            -> SetLatentNoiseMask, LatentNoiseMaskRebase, ...
+
+        `latent_frame_count` matches the prev_latent's `samples.shape[2]`
+        (the VACE-encoded latent length INCLUDING any prepended ref slots).
+        If you connect `reference_latent`, this is auto-derived from it.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "latent_frame_count": ("INT", {
+                    "default": 22, "min": 1, "max": 4096,
+                    "tooltip": "Total latent frames including prepended ref slots. "
+                               "Equal to prev_latent samples.shape[2]. Ignored if "
+                               "reference_latent is connected.",
+                }),
+            },
+            "optional": {
+                "reference_latent": ("LATENT", {
+                    "tooltip": "If connected, latent_frame_count is taken from "
+                               "samples.shape[2] of this latent (overrides the int).",
+                }),
+                "aggregation": (["max", "min", "mean"], {
+                    "default": "max",
+                    "tooltip": "How to combine pixel mask values inside each latent's "
+                               "4-pixel range. 'max' = any masked pixel makes the latent "
+                               "masked (errs on regenerate at fuzzy boundaries). 'min' "
+                               "= all pixels must be unmasked for the latent to be "
+                               "unmasked (errs on preserve). For sharp boundaries the "
+                               "choice doesn't matter.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "convert"
+    CATEGORY = "latent/video"
+
+    def convert(self, mask, latent_frame_count, reference_latent=None, aggregation="max"):
+        m = mask
+        if m.ndim == 2:
+            m = m.unsqueeze(0)
+        if m.ndim != 3:
+            raise ValueError(
+                f"[WanPixelMaskToLatentMask] expected 2D [H,W] or 3D [F,H,W] mask, "
+                f"got shape {tuple(m.shape)}"
+            )
+
+        if reference_latent is not None:
+            T_l = int(reference_latent["samples"].shape[2])
+        else:
+            T_l = int(latent_frame_count)
+
+        T_p, H, W = m.shape
+        out = torch.zeros((T_l, H, W), dtype=m.dtype, device=m.device)
+
+        for lt in range(T_l):
+            if lt == 0:
+                p_start, p_end = 0, 1
+            else:
+                p_start = (lt - 1) * 4 + 1
+                p_end = lt * 4 + 1
+
+            if p_start >= T_p:
+                if T_p > 0:
+                    out[lt] = m[T_p - 1]
+                continue
+            p_end = min(p_end, T_p)
+            chunk = m[p_start:p_end]
+
+            if aggregation == "max":
+                out[lt] = chunk.amax(dim=0)
+            elif aggregation == "min":
+                out[lt] = chunk.amin(dim=0)
+            else:
+                out[lt] = chunk.mean(dim=0)
+
+        return (out,)
+
+
+class LatentTailContinuation:
+    """Build chunk N+1's source latent by slicing chunk N's tail latents directly,
+    bypassing the pixel→PNG→VAE-encode round-trip that drifts the overlap region.
+
+    In a stock chunked WAN VACE flow the source latent for chunk N+1 is built by
+    decoding chunk N's latent to pixels, writing PNG, re-loading those pixels via
+    `VideoContinuationGenerator`, and re-encoding via `VAEEncode`. The VAE
+    encode→decode→encode round-trip + 8-bit PNG quantization drift the "preserved"
+    overlap latents away from chunk N's actual values. The drift shows up as a
+    blurry crossfade and a jittery preserve→regen seam in the assembler output —
+    most visible at chunk N+1's pixels 16–17 (boundary between video latent 4 and
+    video latent 5 for overlap=17).
+
+    This node skips that round-trip: it slices the last K latents from chunk N's
+    sampled latent (the latent that was about to be VAE.decoded) and places them
+    at the front of a fresh source latent, leaving the regen region as zeros (the
+    sampler's mask-1 path uses prev_latent there, not source, so zeros is fine).
+    K = 1 + ceil((overlap_pixels - 1) / 4) per WAN's t/4+1 layout (e.g. P=17 → 5).
+
+    Wiring (replaces `VAEEncode` of `continuation_video` on the source path):
+        SamplerCustomAdvanced (chunk N output)
+          → LatentTailContinuation(overlap_pixels=17, target_video_latent_count=21)
+          → LatentPrependRefFrame
+          → LatentNoiseMaskRebase
+
+    The pixel-space `continuation_video` path going into `WanVaceToVideoScheduled`'s
+    `control_video` input is unchanged — VACE conditioning still uses pixels.
+
+    Caveat at pixel 0: chunk N+1's first video latent is a single-pixel I-frame
+    encoding (not a 4-pixel encoding). Slicing places chunk N's regular 4-pixel
+    latent there, which is a small type mismatch. In practice the assembler
+    crossfade hides it; if you see issues specifically at pixel 0, mark that one
+    latent slot as regen instead.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prev_latent": ("LATENT", {
+                    "tooltip": "Chunk N's sampled latent (after TrimVideoLatent or before — "
+                               "slicing the tail picks chunk N's last video latents either way).",
+                }),
+                "overlap_pixels": ("INT", {
+                    "default": 17, "min": 1, "max": 256, "step": 4,
+                    "tooltip": "Pixel-space overlap. Must match VCG's overlap_frames. "
+                               "Use 4N+1 (5, 9, 13, 17, 21…) for a clean WAN VAE boundary.",
+                }),
+            },
+            "optional": {
+                "source_latent": ("LATENT", {
+                    "tooltip": "VAE-encoded continuation_video (your existing VAEEncode "
+                               "output). When connected, the output keeps this latent's "
+                               "middle/end slots unchanged — important if your mask "
+                               "preserves those positions (e.g. control_images-driven "
+                               "middle frames). Only the first `overlap_latents` slots "
+                               "are replaced with chunk N's bit-exact tail. Strongly "
+                               "recommended whenever VCG sets parts of the middle to "
+                               "mask=0.",
+                }),
+                "target_video_latent_count": ("INT", {
+                    "default": 21, "min": 1, "max": 4096,
+                    "tooltip": "Used only when source_latent is NOT connected. "
+                               "Number of video latents to output, computed as "
+                               "((pixel_length - 1) / 4) + 1. Ignored when "
+                               "source_latent is connected (shape is taken from it).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT")
+    RETURN_NAMES = ("source_latent", "overlap_latents")
+    FUNCTION = "build"
+    CATEGORY = "latent/video"
+
+    def build(self, prev_latent, overlap_pixels, source_latent=None, target_video_latent_count=21):
+        prev = prev_latent["samples"]
+        if prev.ndim != 5:
+            raise ValueError(
+                f"[LatentTailContinuation] expected 5D prev_latent (B,C,T,H,W), got {tuple(prev.shape)}"
+            )
+        B, C, T_prev, H, W = prev.shape
+
+        # WAN: latent 0 ↔ pixel 0; latent k≥1 ↔ pixels [(k-1)·4+1, k·4+1).
+        # Latents covering pixels [0, overlap_pixels): 1 + ceil((overlap_pixels-1)/4).
+        if overlap_pixels < 1:
+            overlap_latents = 0
+        else:
+            overlap_latents = 1 + (overlap_pixels - 1 + 3) // 4
+
+        if overlap_latents > T_prev:
+            raise ValueError(
+                f"[LatentTailContinuation] need {overlap_latents} latents from prev's tail "
+                f"(overlap_pixels={overlap_pixels}), but prev_latent has only {T_prev}."
+            )
+
+        if source_latent is not None:
+            src = source_latent["samples"]
+            if src.ndim != 5:
+                raise ValueError(
+                    f"[LatentTailContinuation] expected 5D source_latent, got {tuple(src.shape)}"
+                )
+            if src.shape[1] != C or src.shape[3] != H or src.shape[4] != W:
+                raise ValueError(
+                    f"[LatentTailContinuation] source_latent C/H/W mismatch with prev_latent: "
+                    f"prev={tuple(prev.shape)} source={tuple(src.shape)}"
+                )
+            if overlap_latents > src.shape[2]:
+                raise ValueError(
+                    f"[LatentTailContinuation] overlap_latents ({overlap_latents}) exceeds "
+                    f"source_latent length ({src.shape[2]})."
+                )
+            out = src.to(device=prev.device, dtype=prev.dtype).clone()
+        else:
+            # No source provided: fill non-overlap slots with latents_mean (gray-equivalent
+            # in raw space; normalizes to zero after process_latent_in). Plain zeros here
+            # would normalize to -mean/std — a per-channel bias the first sampler reads as
+            # content and stamps as a brown wash. Only correct when the user's mask is
+            # mask=1 across the entire non-overlap region.
+            if overlap_latents > target_video_latent_count:
+                raise ValueError(
+                    f"[LatentTailContinuation] overlap_latents ({overlap_latents}) exceeds "
+                    f"target_video_latent_count ({target_video_latent_count})."
+                )
+            latents_mean = comfy.latent_formats.Wan21().latents_mean.to(
+                device=prev.device, dtype=prev.dtype,
+            )
+            out = latents_mean.expand(B, C, target_video_latent_count, H, W).clone()
+
+        if overlap_latents > 0:
+            out[:, :, :overlap_latents, :, :] = prev[:, :, -overlap_latents:, :, :]
+
+        return ({"samples": out}, overlap_latents)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVaceToVideoScheduled": WanVaceToVideoScheduled,
     "VaceScheduleKSampler": VaceScheduleKSampler,
@@ -1524,6 +1799,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPrependRefFrame": MaskPrependRefFrame,
     "LatentNoiseMaskInspect": LatentNoiseMaskInspect,
     "LatentNoiseMaskRebase": LatentNoiseMaskRebase,
+    "WanPixelMaskToLatentMask": WanPixelMaskToLatentMask,
+    "LatentTailContinuation": LatentTailContinuation,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1537,4 +1814,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPrependRefFrame": "Mask Prepend Ref Frame (for rebase)",
     "LatentNoiseMaskInspect": "Latent Noise Mask Inspect (debug)",
     "LatentNoiseMaskRebase": "Latent Noise Mask Rebase (chain anchor)",
+    "WanPixelMaskToLatentMask": "WAN Pixel→Latent Mask (exact t/4+1)",
+    "LatentTailContinuation": "Latent Tail Continuation (skip VAE round-trip)",
 }
